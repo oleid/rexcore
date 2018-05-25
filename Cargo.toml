@@ -1,0 +1,6 @@
+[package]
+name = "rexcore"
+version = "0.1.0"
+authors = ["oleid"]
+
+[dependencies]
