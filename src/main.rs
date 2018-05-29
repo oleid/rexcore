@@ -1,53 +1,7 @@
-#![feature(unboxed_closures, fn_traits)]
-
+use std::cell::{RefCell, RefMut};
 use std::fmt::Debug;
-use std::ops::{FnMut, FnOnce};
-
-
-// Currently unused, but probably this is needed to decouple
-// multiple threads using a channel or something alike.
-
-struct EventSink<T: Send + Clone + Debug> {
-    callable: Box<FnMut(T)>,
-}
-
-// Implement traits FnOnce and FnMut, so that an event
-// sink can be called like a function.
-
-impl<T> FnOnce<(T,)> for EventSink<T>
-where
-    T: Send + Clone + Debug,
-{
-    type Output = ();
-    extern "rust-call" fn call_once(mut self, args: (T,)) -> Self::Output {
-        self.sink(args.0)
-    }
-}
-
-impl<T> FnMut<(T,)> for EventSink<T>
-where
-    T: Send + Clone + Debug,
-{
-    extern "rust-call" fn call_mut(&mut self, args: (T,)) -> Self::Output {
-        self.sink(args.0)
-    }
-}
-
-impl<T: Send + Clone + Debug> EventSink<T> {
-    pub fn new<F>(func: F) -> EventSink<T>
-    where
-        F: FnMut(T) + 'static, // still not sure about 'static, https://doc.rust-lang.org/error-index.html#E0309
-    {
-        EventSink::<T> {
-            callable: Box::new(func),
-        }
-    }
-
-    fn sink(&mut self, val: T) {
-        println!("Sinking {:?}", val);
-        (self.callable)(val);
-    }
-}
+use std::ops::FnMut;
+use std::rc::Rc;
 
 struct EventSource<T: Send + Clone + Debug> {
     targets: Vec<Box<FnMut(T)>>,
@@ -55,7 +9,9 @@ struct EventSource<T: Send + Clone + Debug> {
 
 impl<T: Send + Clone + Debug> EventSource<T> {
     pub fn new() -> EventSource<T> {
-        EventSource::<T> { targets: vec![] }
+        EventSource::<T> {
+            targets: Vec::new(),
+        }
     }
 
     fn fire(&mut self, val: T) {
@@ -66,12 +22,37 @@ impl<T: Send + Clone + Debug> EventSource<T> {
     }
 }
 
+// Takes a node containing an object and a function name
+// and creates a closure calling the function of that object.
+// To make this work, the closure takes ownership of a clone
+// of the refcounted object in the node. The object, in turn,
+// is contained in a ref-cell, which is needed for run-time 
+// borrow-checking.
+//
+// This won't compile if source and sink(i.e. the node)
+// live in different threads. In this case, probably something
+// like src =>> region_barrier_sink | mpc_channel | region_barrier_source =>> actual_sink
+// would be needed. 
+macro_rules! sink {
+    (at $node:ident,call $func:expr) => {{
+        let obj = $node.clone_obj();
+        move |v| ($func)(&mut obj.borrow_mut(), v)
+    }};
+}
 
 // Recursively call callables implementing some Fn trait
 macro_rules! chain {
-    // -- Intermediate connection -- first function takes a value
+    // -- call $dest with the result of $src
     ( $src:expr =>> $dest:expr) => {
-        move |v| ($dest)(  ($src)(v)  )
+        {
+            // we need to assign the closures to values, before
+            // creating the new closure, in order to make sink!
+            // work. Otherwise the entire $node is moved into the lambda.
+            let f1 = $src;
+            let f2 = $dest;
+
+            move |v| f2(f1(v))
+        }
     };
     // --- Handle the rest recursively
     ($src:expr =>> $dest:expr  $(=>> $dests:expr)+ ) => {
@@ -84,11 +65,11 @@ macro_rules! chain {
 
 macro_rules! connect {
     // Use the above's chain macro to handle multiple parameters
-    ($src:expr =>> $dest:expr $(=>> $dests:expr)+ ) => {{
-        connect!( $src =>>  chain!($dest $(=>> $dests)+ ) )
+    ($src:expr  =>> $trans1:expr $(=>> $transes:expr)+ ) => {{
+        connect!( $src =>>  chain!($trans1 $(=>> $transes)+ ) )
     }};
     ( $src:expr =>> $dest:expr ) => {
-        $src.targets.push( Box::new($dest) );
+        $src.targets.push( Box::new($dest));
     };
 }
 
@@ -119,12 +100,34 @@ impl Akkumulator {
     }
 }
 
+struct Node<Obj> {
+    _name: String,
+    obj: Rc<RefCell<Obj>>,
+}
+
+impl<Obj> Node<Obj> {
+    pub fn new(_name: String, obj: Obj) -> Node<Obj> {
+        Node {
+            _name,
+            obj: Rc::new(RefCell::new(obj)),
+        }
+    }
+
+    pub fn get_obj(&self) -> RefMut<Obj> {
+        self.obj.borrow_mut()
+    }
+
+    pub fn clone_obj(&self) -> Rc<RefCell<Obj>> {
+        self.obj.clone()
+    }
+}
+
 fn main() {
-    let closure = |v| v * v + 1;
-    let complicated_calculation = chain!(
-        |a| 2*a =>>
-        |b| 3*b =>>
-        |c| 4*c =>> closure);
+    let closure = |v: usize| v * v + 1;
+    let complicated_calculation = chain!( |a : usize| 2*a
+        =>> |b| 3*b
+        =>>|c| 4*c
+        =>> closure);
 
     let mut e = EventSource::new();
 
@@ -135,17 +138,25 @@ fn main() {
     e.fire(12345);
 
     // Akku-Beispiel
+    let akku = Node::new("Akkumulator".to_owned(), Akkumulator::new());
 
-    let mut akku = Akkumulator::new();
+    connect!(e
+        =>> |v| 3.141 * v as f32
+        =>> |w : f32| w.sqrt()
+        =>> |x| println!("{}", x )
+    );
 
-    // Hier ist der Knackpunkt: man kann die Reihenfolge nicht umdrehen,
-    // da sonst akku. nimmer zugreifbar ist, da er in die event-source
-    // rein-gemovt wurde. Und man braucht "move", weil sonst der Compiler
-    // sagt, dass akku wohl nicht lange genug lebt.
-    connect!(akku.out_accumulator()
-        =>> |v| println!("\tAccum hat {} gesendet", v ));
+    connect!(e
+        =>> | v | { println!("Just inspecting {}", v); v }
+        =>> sink!(at akku, call Akkumulator::accumulate)
+    );
 
-    connect!(e =>> move |v| akku.accumulate(v));
+    connect!(
+        akku.get_obj().out_accumulator()
+        =>> |a| 2*a
+        =>> |b| b / 2
+        =>> |v| println!("Akku ist geladen zu {}", v) 
+    );
 
     for i in 1..6 {
         e.fire(i);
