@@ -1,6 +1,9 @@
 [package]
 name = "rexcore"
-version = "0.1.0"
-authors = ["oleid"]
+version = "0.0.1"
+authors = ["Olaf Leidinger<oleid@mescharet.de>"]
+
+[lib]
 
 [dependencies]
+log = "*"
