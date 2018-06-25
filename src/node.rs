@@ -4,6 +4,7 @@ use std::rc::Rc;
 /// A node object, which has interior mutability and holds a shared reference to some object
 ///
 /// Used to hide the details of the sink! macro.
+#[derive(Debug)]
 pub struct Node<Obj> {
     obj: Rc<RefCell<Obj>>,
 }
@@ -23,6 +24,15 @@ impl<Obj> Node<Obj> {
     /// Clone the underlying object. Used for putting a reference into the EventSource.
     pub fn clone_obj(&self) -> Rc<RefCell<Obj>> {
         self.obj.clone()
+    }
+}
+
+impl<Obj> Clone for Node<Obj> {
+    // Manual implementation; Obj needs no Clone, since it's in a Rc
+    fn clone(&self) -> Self {
+        Node {
+            obj: self.clone_obj(),
+        }
     }
 }
 
